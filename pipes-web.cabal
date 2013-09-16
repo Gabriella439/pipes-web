@@ -1,0 +1,33 @@
+Name: pipes-web
+Version: 1.0.0
+Cabal-Version: >=1.8.0.2
+Build-Type: Simple
+License: BSD3
+License-File: LICENSE
+Copyright: 2013 Gabriel Gonzalez
+Author: Gabriel Gonzalez
+Maintainer: Gabriel439@gmail.com
+Bug-Reports: https://github.com/Gabriel439/Haskell-Pipes-Web-Library/issues
+Synopsis: Deploy pipes over the web
+Description: Use @pipes-web@ to deploy pipes from a server that others can
+  easily install over the network.
+Category: Pipes, Network
+Source-Repository head
+    Type: git
+    Location: https://github.com/Gabriel439/Haskell-Pipes-Web-Library
+
+Library
+    Hs-Source-Dirs: src
+    Build-Depends:
+        base             >= 4       && < 5   ,
+        binary                         < 0.8 ,
+        bytestring                     < 0.11,
+        network          >= 2.2.3   && < 2.5 ,
+        pipes            >= 4.0.0   && < 4.1 ,
+        pipes-binary     >= 0.2.0   && < 0.3 ,
+        pipes-bytestring >= 1.0.0   && < 1.1 ,
+        pipes-network    >= 0.6.0   && < 0.7 ,
+        pipes-safe       >= 2.0.0   && < 2.1 ,
+        transformers     >= 0.2.0.0 && < 0.4
+    Exposed-Modules: Pipes.Web
+    GHC-Options: -O2 -Wall
