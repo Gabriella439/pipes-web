@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE RankNTypes #-}
 
 {-| You can 'deploy' a simple incrementing pipe like this:
 
@@ -59,6 +59,8 @@ module Pipes.Web (
 
     -- * Install
     install,
+    PaaS(..),
+    Managed(..),
 
     -- * Re-exports
     HostPreference(..),
@@ -67,95 +69,126 @@ module Pipes.Web (
     withSocketsDo
     ) where
 
-import Control.Monad (when)
-import Control.Monad.Trans.State.Strict (StateT, evalStateT)
-import qualified Data.ByteString as B
-import Data.ByteString (ByteString)
+import Control.Applicative (Applicative(pure, (<*>)), liftA2)
+import Control.Category (Category((.), id))
+import Control.Exception (bracket, throwIO)
+import Control.Monad.Trans.State.Strict (runStateT)
+import qualified Data.ByteString as ByteString
 import Data.Word (Word8)
-import Network.Socket.ByteString (sendAll)
+import Lens.Family (view)
 import Pipes
-import Pipes.Internal (unsafeHoist)
-import Pipes.Lift (evalStateP)
-import qualified Pipes.Network.TCP as PN
-import Pipes.Network.TCP (
-    HostPreference(..), ServiceName, HostName, withSocketsDo)
-import qualified Pipes.Network.TCP.Safe as Safe
-import Pipes.Safe (MonadSafe, Base)
-import qualified Pipes.ByteString as PB
-import Pipes.Binary (encode, decode)
+import Pipes.Binary (Binary, encode, decode, decoded)
+import Pipes.ByteString (nextByte)
+import Pipes.Network.TCP
+import Prelude hiding ((.), id)
 
-import Data.Binary (Binary)
+-- TODO: Come up with an exception type for magic byte decoding errors
+-- TODO: Remove dead code
+-- TODO: Clean up re-exports by just re-exporting a module
+-- TODO: All explicit imports
 
 -- Chosen by fair 1d256 rolls
 
-magicNumberAwait :: Word8
-magicNumberAwait = 23
+-- Service requesting more input
+magicByteNext :: Word8
+magicByteNext = 83
 
-magicNumberYield :: Word8
-magicNumberYield = 146
+-- Service emitting a new value
+magicByteYield :: Word8
+magicByteYield = 30
 
-upstream
-    :: (MonadIO m, Binary a)
-    => PN.Socket -> Producer a (StateT (Producer ByteString m r) m) ()
-upstream socket = go
-  where
-    go = do
-        liftIO $ sendAll socket (B.singleton magicNumberAwait)
-        y <- lift decode
-        case y of
-            Right (_, a) -> do
-                yield a
-                go
-            _  -> return ()
-
-downstream
-    :: (MonadIO m, Binary b)
-    => PN.Socket -> Consumer b (StateT (Producer ByteString m r) m) ()
-downstream socket = go >-> PN.toSocket socket
-  where
-    go = do
-        x <- lift PB.draw
-        case x of
-            Right 0 -> do
-                b <- await
-                liftIO $ sendAll socket (B.singleton magicNumberYield)
-                encode b
-                go
-            _ -> return ()
+-- magicByteReturn :: Word8
+-- magicByteReturn = 29
 
 -- | 'deploy' a 'Pipe' that others can 'install'
 deploy
     :: (Binary a, Binary b)
-    => HostPreference -> ServiceName -> Pipe a b IO () -> IO ()
-deploy hostPreference serviceName pipe =
-    PN.serve hostPreference serviceName $ \(socket, sockAddr) -> do
-        putStrLn $ "Opening pipe for: " ++ show sockAddr
-        (`evalStateT` (PN.fromSocket socket 4096)) $ runEffect $
-            upstream socket >-> unsafeHoist lift pipe >-> downstream socket
-        putStrLn $ "Closing pipe for: " ++ show sockAddr
+    => HostPreference
+    -> ServiceName
+    -> (Producer a IO () -> Producer b IO ())
+    -> IO ()
+deploy hostPreference serviceName getter =
+    serve hostPreference serviceName $ \(socket, sockAddr) -> do
+        let open     = putStrLn $ "Opening pipe for: " ++ show sockAddr
+        let close () = putStrLn $ "Closing pipe for: " ++ show sockAddr
+        bracket open close $ \() -> do
+            let pAs = do
+                    _ <- view decoded (fromSocket socket 4096)
+                    return ()
+
+                notifyNext = do
+                    send socket (ByteString.singleton magicByteNext)
+                    for pAs $ \a -> do
+                        yield a
+                        send socket (ByteString.singleton magicByteNext)
+
+                pBs = for (getter notifyNext) encode
+
+                notifyYield = do
+                    for pBs $ \b -> do
+                        send socket (ByteString.singleton magicByteYield)
+                        yield b
+
+--              notifyReturn = do
+--                  notifyYield
+--                  send socket (ByteString.singleton magicByteReturn)
+
+            runEffect $ for notifyYield (send socket)
+
+-- | A managed resource
+newtype Managed r = Managed { _bind :: forall x . (r -> IO x) -> IO x }
+
+instance Functor Managed where
+    fmap f mx = Managed (\_return ->
+        _bind mx (\x ->
+        _return (f x) ) )
+
+instance Applicative Managed where
+    pure r    = Managed (\_return ->
+        _return r )
+    mf <*> mx = Managed (\_return ->
+        _bind mf (\f ->
+        _bind mx (\x ->
+        _return (f x) ) ) )
+
+newtype PaaS a b = PaaS
+    { unPaaS :: Managed (Producer a IO () -> Producer b IO ()) }
+
+instance Category PaaS where
+    id = PaaS (pure id)
+
+    PaaS mf . PaaS mx = PaaS (liftA2 (.) mf mx)
 
 -- | 'install' a 'deploy'ed 'Pipe'
 install
-    :: (Binary a, Binary b, MonadSafe m, Base m ~ IO)
-    => HostName -> ServiceName -> Pipe a b m ()
-install hostName serviceName =
-    Safe.connect hostName serviceName $ \(socket, _) -> do
-        evalStateP (PN.fromSocket socket 4096) $ do
-            let go amDownstream = do
-                    when amDownstream $ liftIO $ sendAll socket (B.singleton 0)
-                    x <- lift PB.draw
-                    case x of
-                        Right w8
-                            | w8 == magicNumberAwait -> do
-                                a <- await
-                                for (encode a) (liftIO . sendAll socket)
-                                go False
-                            | w8 == magicNumberYield -> do
-                                y <- lift decode
-                                case y of
-                                    Right (_, b) -> do
-                                        yield b
-                                        go True
-                                    Left _  -> return ()
-                        _ -> return ()
-            go True
+    :: (Binary a, Binary b)
+    => HostName
+    -> ServiceName
+    -> PaaS a b
+install hostName serviceName = PaaS $ Managed $ \k -> do
+    connect hostName serviceName $ \(socket, _) -> do
+        let f pSocket0 pAs0 = do
+                x <- lift $ nextByte pSocket0
+                case x of
+                    Left   ()            -> return ()
+                    Right (w8, pSocket1) -> case () of
+                        _ | w8 == magicByteNext  -> do
+                            y <- lift $ next pAs0
+                            case y of
+                                Left   ()       -> return ()
+                                Right (a, pAs1) -> do
+                                    for (encode a) (send socket)
+                                    f pSocket1 pAs1
+                          | w8 == magicByteYield -> do
+                            (y, pSocket2) <- lift $ runStateT decode pSocket1
+                            case y of
+                                Left  err -> lift $ throwIO err
+                                Right a   -> do
+                                    yield a
+                                    f pSocket2 pAs0
+                          | otherwise            -> do
+                            lift $ throwIO (userError "Invalid magic byte")
+
+            f' = f (fromSocket socket 4096)
+
+        k f'
